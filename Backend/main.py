@@ -18,7 +18,17 @@ R2_BUCKET_NAME = "shorts-videos"
 R2_PUBLIC_DOMAIN = "https://pub-aae4a510a0ba4c71889c892e5010a7b1.r2.dev" 
 
 # Firebase Setup
-cred = credentials.Certificate("serviceAccountKey.json")
+# Check karenge ki file kahan hai (Local PC vs Render Server)
+if os.path.exists("serviceAccountKey.json"):
+    # Ye Local Computer ke liye hai
+    cred_path = "serviceAccountKey.json"
+else:
+    # Ye Render Server ke liye hai (Secret Files path)
+    cred_path = "/etc/secrets/serviceAccountKey.json"
+
+print(f"🔑 Using Firebase Key at: {cred_path}") # Debugging ke liye
+
+cred = credentials.Certificate(cred_path)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
