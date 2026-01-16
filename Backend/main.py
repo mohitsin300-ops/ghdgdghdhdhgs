@@ -21,9 +21,9 @@ app = FastAPI()
 
 # --- FIREBASE SETUP ---
 if os.path.exists("serviceAccountKey.json"):
-    cred_path = "serviceAccountKey.json"
+    cred_path = "serviceAccountKey.json" # Local
 else:
-    cred_path = "/etc/secrets/serviceAccountKey.json"
+    cred_path = "/etc/secrets/serviceAccountKey.json" # Render
 
 try:
     cred = credentials.Certificate(cred_path)
@@ -63,20 +63,24 @@ def process_video_task(file_path, original_filename, title, category, text, dura
         # 1. Original Upload
         original_s3_key = f"originals/{video_id}.mp4"
         s3_client.upload_file(file_path, R2_BUCKET_NAME, original_s3_key, ExtraArgs={'ContentType': 'video/mp4'})
+        print("✅ Original Uploaded")
         
-        # 2. HLS Conversion (Optimized for Render Free Tier)
+        # 2. HLS Conversion (Optimized for Render Free Tier - Low RAM)
         hls_output_dir = os.path.join(temp_dir, "hls")
         os.makedirs(hls_output_dir, exist_ok=True)
         hls_local_path = os.path.join(hls_output_dir, "master.m3u8")
 
+        print("⚡ Starting FFmpeg...")
         (
             ffmpeg.input(file_path)
             .output(hls_local_path, format='hls', start_number=0, hls_time=4, hls_list_size=0,
+                    # Low Memory Settings: 480p, 1000k bitrate, 1 thread
                     vf='scale=480:854:force_original_aspect_ratio=decrease', 
                     video_bitrate='1000k', audio_bitrate='128k', acodec='aac', vcodec='libx264',
                     preset='ultrafast', threads=1)
             .run(quiet=True, overwrite_output=True)
         )
+        print("⚡ FFmpeg Done")
 
         # 3. Upload Segments
         hls_s3_folder = f"stream/{video_id}"
@@ -86,6 +90,8 @@ def process_video_task(file_path, original_filename, title, category, text, dura
                 s3_key = f"{hls_s3_folder}/{file}"
                 ct = 'application/x-mpegURL' if file.endswith('.m3u8') else 'video/MP2T'
                 s3_client.upload_file(local_file, R2_BUCKET_NAME, s3_key, ExtraArgs={'ContentType': ct})
+        
+        print("✅ HLS Uploaded")
 
         # 4. Firestore Save
         doc_data = {
@@ -141,13 +147,56 @@ def get_videos():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- NEW: DELETE VIDEO ---
+# --- NEW: DELETE VIDEO (R2 + FIRESTORE) ---
 @app.delete("/delete-video/{video_id}")
 def delete_video(video_id: str):
     try:
-        db.collection('hooks').document(video_id).delete()
-        return {"message": "Video Deleted Successfully"}
+        # 1. Firestore se data nikalo (path janne ke liye)
+        doc_ref = db.collection('hooks').document(video_id)
+        doc = doc_ref.get()
+
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="Video not found")
+
+        data = doc.to_dict()
+        
+        # --- A. Delete Original File from R2 ---
+        original_key = data.get('downloadRef') # e.g. "originals/xyz-uuid.mp4"
+        if original_key:
+            try:
+                s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=original_key)
+                print(f"🗑️ Deleted Original R2 File: {original_key}")
+            except Exception as e:
+                print(f"⚠️ Error deleting original from R2: {e}")
+
+        # --- B. Delete HLS Folder from R2 ---
+        # "originals/UUID.mp4" se UUID nikalo taaki "stream/UUID/" folder mile
+        file_uuid = None
+        if original_key:
+            file_uuid = original_key.split('/')[-1].replace('.mp4', '')
+        
+        if file_uuid:
+            hls_prefix = f"stream/{file_uuid}/"
+            try:
+                # Folder ke andar ki saari files list karo
+                objects = s3_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=hls_prefix)
+                
+                if 'Contents' in objects:
+                    # Sabko ek saath delete karo
+                    delete_keys = [{'Key': obj['Key']} for obj in objects['Contents']]
+                    s3_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={'Objects': delete_keys})
+                    print(f"🗑️ Deleted HLS Folder: {hls_prefix}")
+            except Exception as e:
+                print(f"⚠️ Error deleting HLS from R2: {e}")
+
+        # --- C. Delete from Firestore ---
+        doc_ref.delete()
+        print(f"🔥 Deleted from Firestore: {video_id}")
+
+        return {"message": "Video & All Files Deleted Successfully"}
+
     except Exception as e:
+        print(f"❌ Delete Failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- NEW: UPDATE VIDEO (Title, Description, Premium) ---
