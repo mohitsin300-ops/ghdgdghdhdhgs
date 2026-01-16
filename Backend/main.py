@@ -76,17 +76,16 @@ def process_video_task(file_path, original_filename, title, category, text, dura
             (
                 ffmpeg.input(file_path)
                 .output(hls_local_path, format='hls', start_number=0, hls_time=4, hls_list_size=0,
-                        # FIX: scale=480:-2 ensures height is divisible by 2 (Critical for libx264)
-                        # Added pix_fmt='yuv420p' for better compatibility
+                        # FIX: scale=480:-2 ensures height is divisible by 2
                         vf='scale=480:-2', 
-                        video_bitrate='800k', # Reduced slightly for stability
+                        video_bitrate='800k', 
                         audio_bitrate='64k', 
                         acodec='aac', 
                         vcodec='libx264',
                         preset='ultrafast', 
                         threads=1,
                         pix_fmt='yuv420p')
-                .run(capture_stdout=True, capture_stderr=True) # Capture errors now
+                .run(capture_stdout=True, capture_stderr=True)
             )
             print("⚡ FFmpeg Done")
 
@@ -102,12 +101,15 @@ def process_video_task(file_path, original_filename, title, category, text, dura
             print("✅ HLS Uploaded")
 
             # 4. Firestore Save
+            # ✅ CHANGE: Ab downloadRef me FULL URL store hoga
+            full_download_url = f"{R2_PUBLIC_DOMAIN}/{original_s3_key}"
+            
             doc_data = {
                 'title': title,
                 'category': category,
                 'description': text,
                 'videoUrl': f"{R2_PUBLIC_DOMAIN}/{hls_s3_folder}/master.m3u8",
-                'downloadRef': original_s3_key,
+                'downloadRef': full_download_url, # <-- Ab Direct Link
                 'duration': duration,
                 'language': language,
                 'isPremium': is_premium,
@@ -120,10 +122,8 @@ def process_video_task(file_path, original_filename, title, category, text, dura
             print("🔥 Firestore Updated Successfully")
 
         except ffmpeg.Error as e:
-            # Ye ab asli error print karega logs mein
             error_log = e.stderr.decode('utf8')
             print(f"❌ FFmpeg CRASHED: {error_log}")
-            # Optional: Error Firestore mein save kar sakte hain debugging ke liye
 
     except Exception as e:
         print(f"❌ General Processing Error: {e}")
@@ -161,7 +161,7 @@ def get_videos():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- DELETE VIDEO ---
+# --- DELETE VIDEO (UPDATED FOR FULL URL) ---
 @app.delete("/delete-video/{video_id}")
 def delete_video(video_id: str):
     try:
@@ -174,7 +174,15 @@ def delete_video(video_id: str):
         data = doc.to_dict()
         
         # A. Delete Original File
-        original_key = data.get('downloadRef')
+        full_url = data.get('downloadRef')
+        original_key = None
+        
+        # ✅ CHANGE: Full URL se "Key" extract karna zaroori hai delete ke liye
+        if full_url and R2_PUBLIC_DOMAIN in full_url:
+            original_key = full_url.replace(f"{R2_PUBLIC_DOMAIN}/", "")
+        elif full_url:
+            original_key = full_url # Purane videos ke liye jahan sirf key thi
+
         if original_key:
             try:
                 s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=original_key)
@@ -185,6 +193,7 @@ def delete_video(video_id: str):
         # B. Delete HLS Folder
         file_uuid = None
         if original_key:
+            # "originals/UUID.mp4" se UUID nikalna
             file_uuid = original_key.split('/')[-1].replace('.mp4', '')
         
         if file_uuid:
