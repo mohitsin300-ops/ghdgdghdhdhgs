@@ -65,54 +65,69 @@ def process_video_task(file_path, original_filename, title, category, text, dura
         s3_client.upload_file(file_path, R2_BUCKET_NAME, original_s3_key, ExtraArgs={'ContentType': 'video/mp4'})
         print("✅ Original Uploaded")
         
-        # 2. HLS Conversion (Optimized for Render Free Tier - Low RAM)
+        # 2. HLS Conversion (Optimized & Debug Enabled)
         hls_output_dir = os.path.join(temp_dir, "hls")
         os.makedirs(hls_output_dir, exist_ok=True)
         hls_local_path = os.path.join(hls_output_dir, "master.m3u8")
 
         print("⚡ Starting FFmpeg...")
-        (
-            ffmpeg.input(file_path)
-            .output(hls_local_path, format='hls', start_number=0, hls_time=4, hls_list_size=0,
-                    # Low Memory Settings: 480p, 1000k bitrate, 1 thread
-                    vf='scale=480:854:force_original_aspect_ratio=decrease', 
-                    video_bitrate='1000k', audio_bitrate='128k', acodec='aac', vcodec='libx264',
-                    preset='ultrafast', threads=1)
-            .run(quiet=True, overwrite_output=True)
-        )
-        print("⚡ FFmpeg Done")
-
-        # 3. Upload Segments
-        hls_s3_folder = f"stream/{video_id}"
-        for root, dirs, files in os.walk(hls_output_dir):
-            for file in files:
-                local_file = os.path.join(root, file)
-                s3_key = f"{hls_s3_folder}/{file}"
-                ct = 'application/x-mpegURL' if file.endswith('.m3u8') else 'video/MP2T'
-                s3_client.upload_file(local_file, R2_BUCKET_NAME, s3_key, ExtraArgs={'ContentType': ct})
         
-        print("✅ HLS Uploaded")
+        try:
+            (
+                ffmpeg.input(file_path)
+                .output(hls_local_path, format='hls', start_number=0, hls_time=4, hls_list_size=0,
+                        # FIX: scale=480:-2 ensures height is divisible by 2 (Critical for libx264)
+                        # Added pix_fmt='yuv420p' for better compatibility
+                        vf='scale=480:-2', 
+                        video_bitrate='800k', # Reduced slightly for stability
+                        audio_bitrate='64k', 
+                        acodec='aac', 
+                        vcodec='libx264',
+                        preset='ultrafast', 
+                        threads=1,
+                        pix_fmt='yuv420p')
+                .run(capture_stdout=True, capture_stderr=True) # Capture errors now
+            )
+            print("⚡ FFmpeg Done")
 
-        # 4. Firestore Save
-        doc_data = {
-            'title': title,
-            'category': category,
-            'description': text,
-            'videoUrl': f"{R2_PUBLIC_DOMAIN}/{hls_s3_folder}/master.m3u8",
-            'downloadRef': original_s3_key,
-            'duration': duration,
-            'language': language,
-            'isPremium': is_premium,
-            'createdAt': firestore.SERVER_TIMESTAMP,
-            'processed': True,
-            'type': 'video',
-            'views': 0, 'likes': 0
-        }
-        db.collection('hooks').add(doc_data)
-        print("🔥 Firestore Updated Successfully")
+            # 3. Upload Segments
+            hls_s3_folder = f"stream/{video_id}"
+            for root, dirs, files in os.walk(hls_output_dir):
+                for file in files:
+                    local_file = os.path.join(root, file)
+                    s3_key = f"{hls_s3_folder}/{file}"
+                    ct = 'application/x-mpegURL' if file.endswith('.m3u8') else 'video/MP2T'
+                    s3_client.upload_file(local_file, R2_BUCKET_NAME, s3_key, ExtraArgs={'ContentType': ct})
+            
+            print("✅ HLS Uploaded")
+
+            # 4. Firestore Save
+            doc_data = {
+                'title': title,
+                'category': category,
+                'description': text,
+                'videoUrl': f"{R2_PUBLIC_DOMAIN}/{hls_s3_folder}/master.m3u8",
+                'downloadRef': original_s3_key,
+                'duration': duration,
+                'language': language,
+                'isPremium': is_premium,
+                'createdAt': firestore.SERVER_TIMESTAMP,
+                'processed': True,
+                'type': 'video',
+                'views': 0, 'likes': 0
+            }
+            db.collection('hooks').add(doc_data)
+            print("🔥 Firestore Updated Successfully")
+
+        except ffmpeg.Error as e:
+            # Ye ab asli error print karega logs mein
+            error_log = e.stderr.decode('utf8')
+            print(f"❌ FFmpeg CRASHED: {error_log}")
+            # Optional: Error Firestore mein save kar sakte hain debugging ke liye
 
     except Exception as e:
-        print(f"❌ Processing Error: {e}")
+        print(f"❌ General Processing Error: {e}")
+    
     finally:
         if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
         if os.path.exists(file_path): os.remove(file_path)
@@ -132,26 +147,24 @@ async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = Fil
     background_tasks.add_task(process_video_task, temp_filename, file.filename, title, category, text, duration, language, is_premium)
     return {"message": "Upload accepted", "status": "processing"}
 
-# --- NEW: GET ALL VIDEOS (For Admin List) ---
+# --- GET ALL VIDEOS ---
 @app.get("/videos")
 def get_videos():
     try:
-        # Get all videos ordered by date
         docs = db.collection('hooks').order_by('createdAt', direction=firestore.Query.DESCENDING).stream()
         videos = []
         for doc in docs:
             data = doc.to_dict()
-            data['id'] = doc.id # Document ID bhi chahiye update/delete ke liye
+            data['id'] = doc.id 
             videos.append(data)
         return {"videos": videos}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- NEW: DELETE VIDEO (R2 + FIRESTORE) ---
+# --- DELETE VIDEO ---
 @app.delete("/delete-video/{video_id}")
 def delete_video(video_id: str):
     try:
-        # 1. Firestore se data nikalo (path janne ke liye)
         doc_ref = db.collection('hooks').document(video_id)
         doc = doc_ref.get()
 
@@ -160,8 +173,8 @@ def delete_video(video_id: str):
 
         data = doc.to_dict()
         
-        # --- A. Delete Original File from R2 ---
-        original_key = data.get('downloadRef') # e.g. "originals/xyz-uuid.mp4"
+        # A. Delete Original File
+        original_key = data.get('downloadRef')
         if original_key:
             try:
                 s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=original_key)
@@ -169,8 +182,7 @@ def delete_video(video_id: str):
             except Exception as e:
                 print(f"⚠️ Error deleting original from R2: {e}")
 
-        # --- B. Delete HLS Folder from R2 ---
-        # "originals/UUID.mp4" se UUID nikalo taaki "stream/UUID/" folder mile
+        # B. Delete HLS Folder
         file_uuid = None
         if original_key:
             file_uuid = original_key.split('/')[-1].replace('.mp4', '')
@@ -178,18 +190,15 @@ def delete_video(video_id: str):
         if file_uuid:
             hls_prefix = f"stream/{file_uuid}/"
             try:
-                # Folder ke andar ki saari files list karo
                 objects = s3_client.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=hls_prefix)
-                
                 if 'Contents' in objects:
-                    # Sabko ek saath delete karo
                     delete_keys = [{'Key': obj['Key']} for obj in objects['Contents']]
                     s3_client.delete_objects(Bucket=R2_BUCKET_NAME, Delete={'Objects': delete_keys})
                     print(f"🗑️ Deleted HLS Folder: {hls_prefix}")
             except Exception as e:
                 print(f"⚠️ Error deleting HLS from R2: {e}")
 
-        # --- C. Delete from Firestore ---
+        # C. Delete from Firestore
         doc_ref.delete()
         print(f"🔥 Deleted from Firestore: {video_id}")
 
@@ -199,7 +208,7 @@ def delete_video(video_id: str):
         print(f"❌ Delete Failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- NEW: UPDATE VIDEO (Title, Description, Premium) ---
+# --- UPDATE VIDEO ---
 @app.put("/update-video/{video_id}")
 def update_video(video_id: str, video: UpdateVideoModel):
     try:
