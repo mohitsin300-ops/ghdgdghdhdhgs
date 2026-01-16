@@ -4,10 +4,11 @@ import uuid
 import boto3
 import ffmpeg
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Body
 from botocore.config import Config
 import firebase_admin
 from firebase_admin import credentials, firestore
+from pydantic import BaseModel
 
 # --- CONFIGURATION ---
 R2_ACCOUNT_ID = "2d7e0facfb0d1a8789c41df977ceb223"
@@ -18,14 +19,11 @@ R2_PUBLIC_DOMAIN = "https://pub-aae4a510a0ba4c71889c892e5010a7b1.r2.dev"
 
 app = FastAPI()
 
-# --- FIREBASE SETUP (SMART PATH) ---
-# Ye check karega ki code Laptop par chal raha hai ya Render par
+# --- FIREBASE SETUP ---
 if os.path.exists("serviceAccountKey.json"):
-    cred_path = "serviceAccountKey.json"  # Local File
-    print("✅ Local Environment Detected: Using local key.")
+    cred_path = "serviceAccountKey.json"
 else:
-    cred_path = "/etc/secrets/serviceAccountKey.json" # Render Secret Path
-    print("✅ Render Environment Detected: Using secret key.")
+    cred_path = "/etc/secrets/serviceAccountKey.json"
 
 try:
     cred = credentials.Certificate(cred_path)
@@ -34,7 +32,6 @@ try:
     print("🔥 Firebase Connected Successfully")
 except Exception as e:
     print(f"❌ Firebase Connection Failed: {e}")
-    # App crash na ho isliye hum yahan pass kar rahe hain, par logs check karna zaroori hai
     pass
 
 # --- R2 CLIENT SETUP ---
@@ -47,125 +44,72 @@ s3_client = boto3.client(
     region_name='auto' 
 )
 
-# --- CORE PROCESSING FUNCTION (Background Task) ---
-def process_video_task(
-    file_path: str, 
-    original_filename: str, 
-    title: str, 
-    category: str, 
-    text: str, 
-    duration: int,
-    language: str,
-    is_premium: bool
-):
+# --- MODELS ---
+class UpdateVideoModel(BaseModel):
+    title: str
+    description: str
+    isPremium: bool
+
+# --- CORE PROCESSING FUNCTION ---
+def process_video_task(file_path, original_filename, title, category, text, duration, language, is_premium):
     try:
         print(f"🎬 Processing started for: {title}")
-        
-        # 1. Unique ID Generation
         video_id = str(uuid.uuid4())
         
-        # Paths Setup
+        # Paths
         temp_dir = f"temp_{video_id}"
         os.makedirs(temp_dir, exist_ok=True)
         
-        # --- OUTPUT 1: ORIGINAL UPLOAD (Private) ---
+        # 1. Original Upload
         original_s3_key = f"originals/{video_id}.mp4"
+        s3_client.upload_file(file_path, R2_BUCKET_NAME, original_s3_key, ExtraArgs={'ContentType': 'video/mp4'})
         
-        print("📤 Uploading Original Video to R2...")
-        s3_client.upload_file(
-            file_path, 
-            R2_BUCKET_NAME, 
-            original_s3_key,
-            ExtraArgs={'ContentType': 'video/mp4'}
-        )
-        print("✅ Original Uploaded")
-
-        # --- OUTPUT 2: HLS CONVERSION (FFmpeg) ---
+        # 2. HLS Conversion (Optimized for Render Free Tier)
         hls_output_dir = os.path.join(temp_dir, "hls")
         os.makedirs(hls_output_dir, exist_ok=True)
-        
-        hls_filename = "master.m3u8"
-        hls_local_path = os.path.join(hls_output_dir, hls_filename)
+        hls_local_path = os.path.join(hls_output_dir, "master.m3u8")
 
-        print("⚡ Starting FFmpeg Conversion...")
-        # FFmpeg Command
         (
-            ffmpeg
-            .input(file_path)
-            .output(
-                hls_local_path, 
-                format='hls', 
-                start_number=0, 
-                hls_time=4, 
-                hls_list_size=0,
-                vf='scale=720:1280:force_original_aspect_ratio=decrease', 
-                video_bitrate='1500k', 
-                audio_bitrate='128k',
-                acodec='aac', 
-                vcodec='libx264',
-                preset='fast'
-            )
+            ffmpeg.input(file_path)
+            .output(hls_local_path, format='hls', start_number=0, hls_time=4, hls_list_size=0,
+                    vf='scale=480:854:force_original_aspect_ratio=decrease', 
+                    video_bitrate='1000k', audio_bitrate='128k', acodec='aac', vcodec='libx264',
+                    preset='ultrafast', threads=1)
             .run(quiet=True, overwrite_output=True)
         )
-        print("⚡ FFmpeg Conversion Done")
 
-        # --- OUTPUT 3: UPLOAD HLS FILES ---
+        # 3. Upload Segments
         hls_s3_folder = f"stream/{video_id}"
-        print("📤 Uploading HLS Segments...")
-        
         for root, dirs, files in os.walk(hls_output_dir):
             for file in files:
                 local_file = os.path.join(root, file)
                 s3_key = f"{hls_s3_folder}/{file}"
-                
-                content_type = 'application/x-mpegURL' if file.endswith('.m3u8') else 'video/MP2T'
-                
-                s3_client.upload_file(
-                    local_file, 
-                    R2_BUCKET_NAME, 
-                    s3_key,
-                    ExtraArgs={'ContentType': content_type}
-                )
+                ct = 'application/x-mpegURL' if file.endswith('.m3u8') else 'video/MP2T'
+                s3_client.upload_file(local_file, R2_BUCKET_NAME, s3_key, ExtraArgs={'ContentType': ct})
 
-        print("✅ HLS Streaming Files Uploaded")
-
-        # --- 4. FIREBASE UPDATE ---
-        stream_url = f"{R2_PUBLIC_DOMAIN}/{hls_s3_folder}/master.m3u8"
-        download_ref = original_s3_key
-
+        # 4. Firestore Save
         doc_data = {
             'title': title,
             'category': category,
-            'description': text,          # Flutter 'text' bhejta hai, hum 'description' mein save karte hain
-            'videoUrl': stream_url,
-            'downloadRef': download_ref,
-            'thumbnailUrl': '',           
+            'description': text,
+            'videoUrl': f"{R2_PUBLIC_DOMAIN}/{hls_s3_folder}/master.m3u8",
+            'downloadRef': original_s3_key,
             'duration': duration,
             'language': language,
             'isPremium': is_premium,
-            'isTrending': False,
-            'likes': 0,
-            'shares': 0,
-            'views': 0,
             'createdAt': firestore.SERVER_TIMESTAMP,
             'processed': True,
-            'type': 'video'
+            'type': 'video',
+            'views': 0, 'likes': 0
         }
-
-        print(f"📝 Saving to Firestore: {doc_data['title']}")
         db.collection('hooks').add(doc_data)
         print("🔥 Firestore Updated Successfully")
 
     except Exception as e:
-        print(f"❌ FATAL ERROR in Processing: {str(e)}")
-        # Yahan hume pata chalega agar FFmpeg ya Firestore fail hua
-    
+        print(f"❌ Processing Error: {e}")
     finally:
-        # Cleanup
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+        if os.path.exists(file_path): os.remove(file_path)
 
 # --- API ENDPOINTS ---
 
@@ -174,47 +118,48 @@ def home():
     return {"status": "Backend is Running 🚀"}
 
 @app.post("/upload-video")
-async def upload_video(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    title: str = Form(...),
-    category: str = Form(...),
-    text: str = Form(...),
-    duration: int = Form(...),
-    language: str = Form("hinglish"),
-    is_premium: bool = Form(False)
-):
-    print(f"📥 Received Upload Request: {title}")
-    
-    # Save upload locally
+async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...), title: str = Form(...), category: str = Form(...), text: str = Form(...), duration: int = Form(...), language: str = Form("hinglish"), is_premium: bool = Form(False)):
     temp_filename = f"temp_upload_{uuid.uuid4()}.mp4"
     with open(temp_filename, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-
-    # Background Task
-    background_tasks.add_task(
-        process_video_task, 
-        temp_filename, 
-        file.filename, 
-        title, 
-        category, 
-        text, 
-        duration, 
-        language, 
-        is_premium
-    )
-
+    
+    background_tasks.add_task(process_video_task, temp_filename, file.filename, title, category, text, duration, language, is_premium)
     return {"message": "Upload accepted", "status": "processing"}
 
-@app.post("/generate-download-link")
-def generate_download_link(video_path: str):
+# --- NEW: GET ALL VIDEOS (For Admin List) ---
+@app.get("/videos")
+def get_videos():
     try:
-        url = s3_client.generate_presigned_url(
-            'get_object',
-            Params={'Bucket': R2_BUCKET_NAME, 'Key': video_path},
-            ExpiresIn=300
-        )
-        return {"downloadUrl": url}
+        # Get all videos ordered by date
+        docs = db.collection('hooks').order_by('createdAt', direction=firestore.Query.DESCENDING).stream()
+        videos = []
+        for doc in docs:
+            data = doc.to_dict()
+            data['id'] = doc.id # Document ID bhi chahiye update/delete ke liye
+            videos.append(data)
+        return {"videos": videos}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- NEW: DELETE VIDEO ---
+@app.delete("/delete-video/{video_id}")
+def delete_video(video_id: str):
+    try:
+        db.collection('hooks').document(video_id).delete()
+        return {"message": "Video Deleted Successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- NEW: UPDATE VIDEO (Title, Description, Premium) ---
+@app.put("/update-video/{video_id}")
+def update_video(video_id: str, video: UpdateVideoModel):
+    try:
+        db.collection('hooks').document(video_id).update({
+            'title': video.title,
+            'description': video.description,
+            'isPremium': video.isPremium
+        })
+        return {"message": "Video Updated Successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
