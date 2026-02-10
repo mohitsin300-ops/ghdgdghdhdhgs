@@ -1,19 +1,16 @@
-# Python ka chhota version use karenge
+# Python 3.9 Slim version use karenge
 FROM python:3.9-slim
 
 # Working directory set karenge
 WORKDIR /app
 
-# System update karke FFmpeg install karenge (Video processing ke liye zaroori)
-RUN apt-get update && \
-    apt-get install -y ffmpeg && \
-    apt-get clean
+# Note: FFmpeg hata diya gaya hai kyunki ab direct upload hai
 
-# Saari files (main.py, json key, requirements) copy karenge
+# Saari files copy karenge
 COPY . .
 
 # Python libraries install karenge
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Server start karenge (Render apne aap PORT set karega)
+# Server start command
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
