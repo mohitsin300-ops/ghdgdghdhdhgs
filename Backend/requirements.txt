@@ -3,5 +3,3 @@ uvicorn
 python-multipart
 boto3
 firebase-admin
-ffmpeg-python
-requests
